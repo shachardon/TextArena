@@ -112,7 +112,7 @@
 | 12 | [SecretMafia](#secretmafia) | 6–15 | | |
 | 13 | [Snake](#snake) | 2–15 | 🌐 | |
 | 14 | [Surround](#surround) | 2–15 | 🌐 | |
-| 15 | [Taboo](#taboo) | 4–8 | | |
+| 15 | [Taboo](#taboo) | 2, 4–8 | | |
 | 16 | [ThreePlayerGOPS](#threeplayergops) | 3 | 🌐 | |
 | 17 | [ThreePlayerIPD](#threeplayeripd) | 3 | 🌐 | |
 | 18 | [ThreePlayerTicTacToe](#threeplayertictactoe) | 3 | 🌐 | |
@@ -3194,6 +3194,8 @@ The board is a `width × height` grid. If >1 players remain, play stops after `m
 | Highest score after max rounds | Winning team    | `+1`       |
 | Tied highest score         | All tied teams    | `0`        |
 | Lower score                | Losing team       | `-1`       |
+
+**Two-player cooperative mode:** with `num_players=2`, the players form a single pair (Player 0 is the Clue Giver, Player 1 the Guesser). Both receive the number of words guessed correctly as their reward.
 
 
 **Env-ids:** Variants support different categories, round limits, and attempts per player.

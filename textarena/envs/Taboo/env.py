@@ -68,18 +68,20 @@ class TabooEnv(ta.Env):
     def reset(self, num_players: int, seed: Optional[int] = None):
         """ Reset the Taboo game to its initial state """
         assert num_players % 2 == 0, "Number of players must be even for Taboo game."
-        assert num_players >= 4, "Taboo game requires at least 4 players."
+        assert num_players >= 2, "Taboo game requires at least 2 players."
         self.state = ta.TeamMultiPlayerState(num_players=num_players, max_turns=None, seed=seed)
 
-        # Calculate number of teams
-        num_teams = 2
-        
+        # Two players form a single cooperative pair; larger games are two competing teams
+        self.cooperative = num_players == 2
+        num_teams = 1 if self.cooperative else 2
+
         # Sample word pairs for each team (10 words per team)
         all_pairs = list(self.data.items())
         random.shuffle(all_pairs)
-        
-        team_word_pairs, words_per_team = {}, 20
-        
+
+        # A cooperative pair draws from the whole category, so a strong pair is not capped by the deck
+        team_word_pairs, words_per_team = {}, (len(all_pairs) if self.cooperative else 20)
+
         for team_id in range(num_teams):
             start_idx = team_id * words_per_team
             end_idx = start_idx + words_per_team
@@ -189,7 +191,26 @@ class TabooEnv(ta.Env):
     def _generate_player_prompt(self, player_id: int, game_state: Dict[str, Any]) -> str:
         """ Generate the initial prompt for a player based on their role """
         team_id = self._get_team_id(player_id)
-        
+
+        if self.cooperative:
+            shared_goal = (
+                "You and your partner are playing together and share one score: both of you receive the number of words guessed correctly.\n"
+                f"The game has {self.max_rounds} rounds of {self.max_attempts_per_player} clue-and-guess exchanges each.\n"
+            )
+            if self.state.role_mapping[player_id] == "Clue Giver":
+                return (
+                    f"You are Player {player_id}, the Clue Giver in a cooperative game of Taboo.\n"
+                    f"{shared_goal}"
+                    "Help your partner guess the secret word without saying the word itself or any of its taboo words.\n"
+                    "On your turn, simply type your clue.\n"
+                )
+            return (
+                f"You are Player {player_id}, the Guesser in a cooperative game of Taboo.\n"
+                f"{shared_goal}"
+                "Work out the secret word from your partner's clues.\n"
+                "On your turn, include your guess in square brackets. For example: [elephant].\n"
+            )
+
         if self.state.role_mapping[player_id] == "Clue Giver":
             # Get the team's first word from their allocated word list
             team_words = game_state["team_word_pairs"][team_id]
@@ -207,7 +228,7 @@ class TabooEnv(ta.Env):
                 f"You are Player {player_id}, the Guesser for Team {team_id} in the Taboo game.\n"
                 "Your goal is to guess the secret word based on the clues provided by the Clue Giver.\n"
                 f"You have {self.max_attempts_per_player} each round to to guess as many words as possible.\n"
-                "On your turn, simply type your guess in squared brackets. For example: ['elephant'].\n"
+                "On your turn, simply type your guess in squared brackets. For example: [elephant].\n"
             )
 
         else:
@@ -279,6 +300,16 @@ class TabooEnv(ta.Env):
 
     def _notify_team_switch(self, next_team: int) -> None:
         """ Notify all players about team switch and provide appropriate information """
+        if self.cooperative:
+            round_number = self.state.game_state["round"]
+            if round_number <= self.state.game_state["max_rounds"]:
+                self.state.add_observation(
+                    message=f"Round {round_number} of {self.state.game_state['max_rounds']} begins.",
+                    observation_type=ta.ObservationType.GAME_ACTION_DESCRIPTION
+                )
+                self._notify_clue_givers_new_word("For this round:")
+            return
+
         # Notify ALL players about team switch
         self.state.add_observation(
             message=f"Team {1 - next_team} has finished their turn. It is now Team {next_team}'s turn to play.", 
@@ -293,7 +324,11 @@ class TabooEnv(ta.Env):
         self.increment_score()
         current_team = self.state.game_state["current_team"]
         self._advance_to_next_word(current_team)
-        
+
+        if self._cooperative_deck_is_empty():
+            self._end_cooperative_game()
+            return
+
         # Check if team has more words, otherwise get next word
         if self.state.game_state["team_word_indices"][current_team] < len(self.state.game_state["team_word_pairs"][current_team]):
             next_word_pair = self.state.game_state["team_word_pairs"][current_team][self.state.game_state["team_word_indices"][current_team]]
@@ -327,7 +362,11 @@ class TabooEnv(ta.Env):
         """ Handle invalid move by clue giver (using taboo words) """
         current_team = self.state.game_state["current_team"]
         self._advance_to_next_word(current_team)  # Penalty: advance word
-        
+
+        if self._cooperative_deck_is_empty():
+            self._end_cooperative_game()
+            return
+
         # Force rotation to next team and get new word for that team
         next_team = self._switch_to_next_team()
         self._rotate_player_by_logic(
@@ -376,23 +415,35 @@ class TabooEnv(ta.Env):
                 terminated_by_invalid = self.state.set_invalid_move(reason=reason)
                 if not terminated_by_invalid:
                     # Don't rotate player on invalid move, give them another chance
-                    pass
-                return self.state.step()
-                
-            guess = match.group(1).strip().lower()
-            correct_word = self.state.game_state["word_to_guess"].lower()
+                    return self.state.step()
 
-            if guess == correct_word:
-                self._handle_correct_guess()
-            else:
+                # Repeated invalid format counts as a wrong guess, so the game cannot stall here
+                self.state.made_invalid_move = False
+                self.state.game_info[player_id]["invalid_move"] = False
                 self._handle_incorrect_guess()
+
+            else:
+                guess = match.group(1).strip().strip("'\"").strip().lower()
+                correct_word = self.state.game_state["word_to_guess"].lower()
+
+                if guess == correct_word:
+                    self._handle_correct_guess()
+                else:
+                    self._handle_incorrect_guess()
 
         else:
             # unexpected
             raise ValueError(f"Unexpected role mapping: {self.state.role_mapping[player_id]}. Expected 'Clue Giver' or 'Guesser'.")
         
         # Check for game end
+        if self.state.done:
+            return self.state.step()
+
         if self.state.game_state["round"] > self.state.game_state["max_rounds"]:
+            if self.cooperative:
+                self._end_cooperative_game()
+                return self.state.step()
+
             # End of the game - compare scores across all teams
             scores = self.state.game_state["score"]
             max_score = max(scores.values())
@@ -414,7 +465,24 @@ class TabooEnv(ta.Env):
         """ Increment the score for the current team """
         current_team = self.state.game_state["current_team"]
         self.state.game_state["score"][current_team] += 1
-        self.state.add_observation(message=f"Team {current_team} scored a point! Current score: {self.state.game_state['score']}", observation_type=ta.ObservationType.GAME_ACTION_DESCRIPTION)
+        if self.cooperative:
+            message = f"Correct! Words guessed so far: {self.state.game_state['score'][current_team]}."
+        else:
+            message = f"Team {current_team} scored a point! Current score: {self.state.game_state['score']}"
+        self.state.add_observation(message=message, observation_type=ta.ObservationType.GAME_ACTION_DESCRIPTION)
+
+    def _cooperative_deck_is_empty(self) -> bool:
+        """ Check whether a cooperative pair has used every word in its deck """
+        if not self.cooperative:
+            return False
+        return self.state.game_state["team_word_indices"][0] >= len(self.state.game_state["team_word_pairs"][0])
+
+    def _end_cooperative_game(self) -> None:
+        """ End a cooperative game, giving both players the shared score as their reward """
+        score = self.state.game_state["score"][0]
+        # set_draw only marks the game as finished; the rewards are overwritten with the shared score
+        self.state.set_draw(reason=f"The game is over. Together, the players guessed {score} words.")
+        self.state.rewards = {pid: score for pid in range(self.state.num_players)}
 
     def _get_current_word_for_team(self, team_id: int) -> Tuple[str, List[str]]:
         """ Get the current word for a specific team """
